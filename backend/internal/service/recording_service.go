@@ -1,9 +1,12 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"strings"
 
 	"github.com/oralhistory/oralhistory/internal/constants"
 	"github.com/oralhistory/oralhistory/internal/dto"
@@ -20,7 +23,11 @@ type RecordingService interface {
 	List(projectID, questionID uint) ([]model.Recording, error)
 	Update(actor *model.User, id uint, req *dto.UpdateRecordingRequest) (*model.Recording, error)
 	UpdateSummary(actor *model.User, id uint, summary string) (*model.Recording, error)
-	AttachAudio(actor *model.User, id uint, audioKey string, duration int) (*model.Recording, error)
+	// UploadAudio 负责录音文件上传的全部编排：生成对象 key、写入对象存储、关联录音记录。
+	UploadAudio(ctx context.Context, actor *model.User, id uint, filename string, file io.Reader, size int64, contentType string, duration int) (*model.Recording, error)
+	// OpenAudio 返回录音元数据与其音频内容流，调用方负责关闭流。
+	OpenAudio(ctx context.Context, id uint) (*model.Recording, io.ReadCloser, error)
+	// Delete 删除录音记录，并清理其在对象存储中的音频文件。
 	Delete(actor *model.User, id uint) error
 	CountByProject(projectID uint) (int64, error)
 }
@@ -29,12 +36,13 @@ type recordingService struct {
 	recordingRepo repository.RecordingRepository
 	projectRepo   repository.ProjectRepository
 	questionRepo  repository.QuestionRepository
+	storageSvc    StorageService
 	logger        *slog.Logger
 }
 
 // NewRecordingService 构造录音服务。
-func NewRecordingService(recordingRepo repository.RecordingRepository, projectRepo repository.ProjectRepository, questionRepo repository.QuestionRepository, logger *slog.Logger) RecordingService {
-	return &recordingService{recordingRepo: recordingRepo, projectRepo: projectRepo, questionRepo: questionRepo, logger: logger}
+func NewRecordingService(recordingRepo repository.RecordingRepository, projectRepo repository.ProjectRepository, questionRepo repository.QuestionRepository, storageSvc StorageService, logger *slog.Logger) RecordingService {
+	return &recordingService{recordingRepo: recordingRepo, projectRepo: projectRepo, questionRepo: questionRepo, storageSvc: storageSvc, logger: logger}
 }
 
 func (s *recordingService) Create(actor *model.User, req *dto.CreateRecordingRequest) (*model.Recording, error) {
@@ -139,7 +147,54 @@ func (s *recordingService) UpdateSummary(actor *model.User, id uint, summary str
 	return recording, nil
 }
 
-func (s *recordingService) AttachAudio(actor *model.User, id uint, audioKey string, duration int) (*model.Recording, error) {
+// UploadAudio 编排录音文件上传：对象 key 规则、对象存储写入、录音记录关联都收口在业务层。
+func (s *recordingService) UploadAudio(ctx context.Context, actor *model.User, id uint, filename string, file io.Reader, size int64, contentType string, duration int) (*model.Recording, error) {
+	objectKey := buildAudioObjectKey(actor.ID, id, filename)
+	if err := s.storageSvc.Upload(ctx, objectKey, file, size, contentType); err != nil {
+		s.logger.Error("upload audio failed", "recording_id", id, "object_key", objectKey, "error", err)
+		return nil, util.NewAppError(constants.CodeInternal, fmt.Sprintf("录音 %d 文件上传失败", id), err)
+	}
+	recording, err := s.attachAudio(actor, id, objectKey, duration)
+	if err != nil {
+		// 对象已上传但记录关联失败，回滚新对象，避免留下孤儿文件。
+		if rmErr := s.storageSvc.Remove(ctx, objectKey); rmErr != nil {
+			s.logger.Error("rollback uploaded audio failed", "recording_id", id, "object_key", objectKey, "error", rmErr)
+		}
+		return nil, err
+	}
+	return recording, nil
+}
+
+// OpenAudio 校验录音及其音频是否存在，并从对象存储取出内容流。
+func (s *recordingService) OpenAudio(ctx context.Context, id uint) (*model.Recording, io.ReadCloser, error) {
+	recording, err := s.Get(id)
+	if err != nil {
+		return nil, nil, err
+	}
+	if recording.AudioKey == "" {
+		return nil, nil, util.NewAppError(constants.CodeNotFound, fmt.Sprintf("录音 %d 尚无音频文件", id), nil)
+	}
+	obj, err := s.storageSvc.Get(ctx, recording.AudioKey)
+	if err != nil {
+		s.logger.Error("get audio failed", "recording_id", id, "object_key", recording.AudioKey, "error", err)
+		return nil, nil, util.NewAppError(constants.CodeInternal, fmt.Sprintf("录音 %d 音频读取失败", id), err)
+	}
+	return recording, obj, nil
+}
+
+// buildAudioObjectKey 按固定规则生成对象存储 key，并从原始文件名推断扩展名。
+func buildAudioObjectKey(actorID, recordingID uint, filename string) string {
+	ext := "webm"
+	if idx := strings.LastIndex(filename, "."); idx >= 0 {
+		if suffix := strings.ToLower(filename[idx+1:]); suffix != "" {
+			ext = suffix
+		}
+	}
+	return fmt.Sprintf("recordings/%d/%d_%s.%s", actorID, recordingID, util.RandHex(8), ext)
+}
+
+// attachAudio 将已上传的对象 key 关联到录音记录，并驱动状态机流转。
+func (s *recordingService) attachAudio(actor *model.User, id uint, audioKey string, duration int) (*model.Recording, error) {
 	recording, err := s.recordingRepo.FindByIDForUpdate(id)
 	if err != nil {
 		if errors.Is(err, repository.ErrNotFound) {
@@ -162,14 +217,23 @@ func (s *recordingService) AttachAudio(actor *model.User, id uint, audioKey stri
 }
 
 func (s *recordingService) Delete(actor *model.User, id uint) error {
-	if _, err := s.recordingRepo.FindByID(id); err != nil {
+	recording, err := s.recordingRepo.FindByID(id)
+	if err != nil {
 		if errors.Is(err, repository.ErrNotFound) {
 			return util.NewAppError(constants.CodeNotFound, fmt.Sprintf("录音 %d 不存在", id), err)
 		}
 		return util.NewAppError(constants.CodeInternal, fmt.Sprintf("查询录音 %d 失败", id), err)
 	}
+	audioKey := recording.AudioKey
 	if err := s.recordingRepo.Delete(id); err != nil {
 		return util.NewAppError(constants.CodeInternal, fmt.Sprintf("删除录音 %d 失败", id), err)
+	}
+	// 数据库记录删除成功后再清理对象存储；清理失败仅记录并返回错误，重试删除幂等收敛。
+	if audioKey != "" {
+		if err := s.storageSvc.Remove(context.Background(), audioKey); err != nil {
+			s.logger.Error("remove audio object failed", "recording_id", id, "object_key", audioKey, "error", err)
+			return util.NewAppError(constants.CodeInternal, fmt.Sprintf("录音 %d 音频文件清理失败", id), err)
+		}
 	}
 	s.logger.Info(fmt.Sprintf(constants.LogRecordingDelete, actor.Username, id))
 	return nil

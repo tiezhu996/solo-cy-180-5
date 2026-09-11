@@ -23,7 +23,15 @@ func ErrorHandler(logger *slog.Logger) gin.HandlerFunc {
 		if errors.As(err, &appErr) {
 			httpStatus := statusOf(appErr.Code)
 			util.Fail(c, httpStatus, appErr.Code, appErr.Message)
-			logger.Warn("request error", "request_id", RequestID(c), "path", c.FullPath(), "code", appErr.Code, "message", appErr.Message)
+			args := []any{"request_id", RequestID(c), "path", c.FullPath(), "code", appErr.Code, "message", appErr.Message}
+			if appErr.Err != nil {
+				args = append(args, "cause", appErr.Err)
+			}
+			if httpStatus >= 500 {
+				logger.Error("request error", args...)
+			} else {
+				logger.Warn("request error", args...)
+			}
 			return
 		}
 		util.Fail(c, http.StatusInternalServerError, constants.CodeInternal, fmt.Sprintf("%s: %v", constants.MsgInternalError, err))

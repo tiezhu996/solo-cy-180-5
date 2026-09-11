@@ -34,19 +34,19 @@ func Setup(cfg *config.Config, db *gorm.DB, rdb *redis.Client, logger *slog.Logg
 	userSvc := service.NewUserService(userRepo, cfg, logger)
 	projectSvc := service.NewProjectService(projectRepo, logger)
 	questionSvc := service.NewQuestionService(questionRepo, projectRepo, logger)
-	recordingSvc := service.NewRecordingService(recordingRepo, projectRepo, questionRepo, logger)
-	markerSvc := service.NewTimelineMarkerService(markerRepo, projectRepo, recordingRepo, logger)
-	auditSvc := service.NewAuditService(auditRepo, logger)
 	storageSvc, err := service.NewStorageService(cfg, logger)
 	if err != nil {
 		return nil, err
 	}
+	recordingSvc := service.NewRecordingService(recordingRepo, projectRepo, questionRepo, storageSvc, logger)
+	markerSvc := service.NewTimelineMarkerService(markerRepo, projectRepo, recordingRepo, logger)
+	auditSvc := service.NewAuditService(auditRepo, logger)
 
 	// handler
 	userHandler := handler.NewUserHandler(userSvc, logger)
 	projectHandler := handler.NewProjectHandler(projectSvc, auditSvc, logger)
 	questionHandler := handler.NewQuestionHandler(questionSvc, auditSvc, logger)
-	recordingHandler := handler.NewRecordingHandler(recordingSvc, storageSvc, auditSvc, logger)
+	recordingHandler := handler.NewRecordingHandler(recordingSvc, auditSvc, logger)
 	markerHandler := handler.NewTimelineMarkerHandler(markerSvc, auditSvc, logger)
 	auditHandler := handler.NewAuditHandler(auditSvc, logger)
 

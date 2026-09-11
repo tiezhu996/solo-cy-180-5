@@ -1,13 +1,10 @@
 package handler
 
 import (
-	"context"
-	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
-	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/oralhistory/oralhistory/internal/constants"
@@ -17,17 +14,16 @@ import (
 	"github.com/oralhistory/oralhistory/internal/util"
 )
 
-// RecordingHandler 录音片段接口处理器。
+// RecordingHandler 录音片段接口处理器，只负责参数解析与响应，业务编排由 RecordingService 完成。
 type RecordingHandler struct {
 	recordingSvc service.RecordingService
-	storageSvc   service.StorageService
 	auditSvc     service.AuditService
 	logger       *slog.Logger
 }
 
 // NewRecordingHandler 构造录音处理器。
-func NewRecordingHandler(recordingSvc service.RecordingService, storageSvc service.StorageService, auditSvc service.AuditService, logger *slog.Logger) *RecordingHandler {
-	return &RecordingHandler{recordingSvc: recordingSvc, storageSvc: storageSvc, auditSvc: auditSvc, logger: logger}
+func NewRecordingHandler(recordingSvc service.RecordingService, auditSvc service.AuditService, logger *slog.Logger) *RecordingHandler {
+	return &RecordingHandler{recordingSvc: recordingSvc, auditSvc: auditSvc, logger: logger}
 }
 
 // Create 创建录音记录。
@@ -140,7 +136,7 @@ func (h *RecordingHandler) UpdateSummary(c *gin.Context) {
 	util.OKMessage(c, constants.MsgRecordingUpdated, recording)
 }
 
-// UploadAudio 上传录音文件到 MinIO 并关联到录音记录。
+// UploadAudio 上传录音文件并关联到录音记录；上传编排在业务层完成。
 func (h *RecordingHandler) UploadAudio(c *gin.Context) {
 	actor, err := middleware.CurrentUser(c)
 	if err != nil {
@@ -158,58 +154,37 @@ func (h *RecordingHandler) UploadAudio(c *gin.Context) {
 	}
 	defer file.Close()
 
-	ext := "webm"
-	if name := header.Filename; name != "" {
-		if idx := strings.LastIndex(name, "."); idx >= 0 {
-			ext = strings.ToLower(name[idx+1:])
-		}
-	}
-	objectKey := fmt.Sprintf("recordings/%d/%d_%s.%s", actor.ID, id, util.RandHex(8), ext)
-	if err := h.storageSvc.Upload(c.Request.Context(), objectKey, file, header.Size, header.Header.Get("Content-Type")); err != nil {
-		h.logger.Error("upload audio failed", "recording_id", id, "error", err)
-		util.Fail(c, http.StatusInternalServerError, constants.CodeInternal, fmt.Sprintf("录音 %d 文件上传失败", id))
-		return
-	}
 	duration, _ := strconv.Atoi(c.PostForm("duration_seconds"))
-	recording, err := h.recordingSvc.AttachAudio(actor, id, objectKey, duration)
+	recording, err := h.recordingSvc.UploadAudio(c.Request.Context(), actor, id, header.Filename,
+		file, header.Size, header.Header.Get("Content-Type"), duration)
 	if err != nil {
 		c.Error(err)
 		return
 	}
 	h.auditSvc.Record(actor.ID, actor.Username, actor.Role, "recording.upload", "recording", recording.ID,
-		"上传录音文件 "+objectKey, c.ClientIP(), middleware.RequestID(c))
+		"上传录音文件 "+recording.AudioKey, c.ClientIP(), middleware.RequestID(c))
 	util.OKMessage(c, constants.MsgRecordingUploaded, recording)
 }
 
-// PlayAudio 从 MinIO 流式返回录音音频。
+// PlayAudio 流式返回录音音频；取流与校验在业务层完成，这里只负责拷贝到响应体。
 func (h *RecordingHandler) PlayAudio(c *gin.Context) {
 	id, ok := parseID(c, "id")
 	if !ok {
 		return
 	}
-	recording, err := h.recordingSvc.Get(id)
+	recording, obj, err := h.recordingSvc.OpenAudio(c.Request.Context(), id)
 	if err != nil {
 		c.Error(err)
 		return
 	}
-	if recording.AudioKey == "" {
-		util.Fail(c, http.StatusNotFound, constants.CodeNotFound, fmt.Sprintf("录音 %d 尚无音频文件", id))
-		return
-	}
-	obj, err := h.storageSvc.Get(context.Background(), recording.AudioKey)
-	if err != nil {
-		h.logger.Error("get audio failed", "recording_id", id, "error", err)
-		util.Fail(c, http.StatusInternalServerError, constants.CodeInternal, fmt.Sprintf("录音 %d 音频读取失败", id))
-		return
-	}
 	defer obj.Close()
 	c.Header("Content-Type", "audio/webm")
-	c.Header("Content-Disposition", fmt.Sprintf("inline; filename=recording_%d.webm", id))
+	c.Header("Content-Disposition", "inline; filename=recording_"+strconv.FormatUint(uint64(recording.ID), 10)+".webm")
 	c.Status(http.StatusOK)
 	_, _ = io.Copy(c.Writer, obj)
 }
 
-// Delete 删除录音。
+// Delete 删除录音并清理其音频文件（清理编排在业务层）。
 func (h *RecordingHandler) Delete(c *gin.Context) {
 	actor, err := middleware.CurrentUser(c)
 	if err != nil {

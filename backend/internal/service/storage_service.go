@@ -16,7 +16,8 @@ import (
 // StorageService 录音文件对象存储服务（MinIO）。
 type StorageService interface {
 	Upload(ctx context.Context, objectKey string, reader io.Reader, size int64, contentType string) error
-	Get(ctx context.Context, objectKey string) (*minio.Object, error)
+	// Get 返回对象内容流，调用方负责 Close。返回类型不绑定具体对象存储 SDK。
+	Get(ctx context.Context, objectKey string) (io.ReadCloser, error)
 	Remove(ctx context.Context, objectKey string) error
 }
 
@@ -57,7 +58,7 @@ func (s *storageService) Upload(ctx context.Context, objectKey string, reader io
 	return nil
 }
 
-func (s *storageService) Get(ctx context.Context, objectKey string) (*minio.Object, error) {
+func (s *storageService) Get(ctx context.Context, objectKey string) (io.ReadCloser, error) {
 	obj, err := s.client.GetObject(ctx, s.bucket, objectKey, minio.GetObjectOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("get object %s: %w", objectKey, err)
