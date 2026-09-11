@@ -64,11 +64,13 @@ func (f *fakeRecordingRepo) CountByProject(projectID uint) (int64, error) {
 
 // fakeStorage 对象存储的内存实现，记录调用与对象内容。
 type fakeStorage struct {
-	objects   map[string][]byte
-	removed   []string
-	uploadErr error
-	getErr    error
-	removeErr error
+	objects     map[string][]byte
+	removed     []string
+	uploadErr   error
+	getErr      error
+	removeErr   error
+	removeFailN int // Remove 前 N 次返回 removeErr，之后恢复成功（模拟存储短暂故障后恢复）
+	removeCalls int
 }
 
 func newFakeStorage() *fakeStorage {
@@ -95,10 +97,17 @@ func (f *fakeStorage) Get(_ context.Context, objectKey string) (io.ReadCloser, e
 	}
 	return io.NopCloser(bytes.NewReader(data)), nil
 }
+
+// Remove 模拟 S3/MinIO 删除：对象不存在也视为删除成功（删除幂等）。
 func (f *fakeStorage) Remove(_ context.Context, objectKey string) error {
+	f.removeCalls++
 	f.removed = append(f.removed, objectKey)
-	if f.removeErr != nil {
-		return f.removeErr
+	if f.removeFailN > 0 {
+		f.removeFailN--
+		if f.removeErr != nil {
+			return f.removeErr
+		}
+		return errors.New("remove failed")
 	}
 	delete(f.objects, objectKey)
 	return nil
@@ -269,7 +278,7 @@ func TestRecordingServiceOpenAudio(t *testing.T) {
 func TestRecordingServiceDeleteCleansObject(t *testing.T) {
 	actor := &model.User{ID: 7, Username: "interviewer", Role: constants.RoleInterviewer}
 
-	t.Run("deletes db row and audio object", func(t *testing.T) {
+	t.Run("deletes object before db row", func(t *testing.T) {
 		repo := &fakeRecordingRepo{recordings: map[uint]*model.Recording{
 			5: {ID: 5, AudioKey: "recordings/7/5/a.webm"},
 		}}
@@ -277,7 +286,7 @@ func TestRecordingServiceDeleteCleansObject(t *testing.T) {
 		storage.objects["recordings/7/5/a.webm"] = []byte("x")
 		svc := newTestRecordingService(repo, storage)
 
-		if err := svc.Delete(actor, 5); err != nil {
+		if err := svc.Delete(context.Background(), actor, 5); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		if len(repo.deletedIDs) != 1 || repo.deletedIDs[0] != 5 {
@@ -285,6 +294,9 @@ func TestRecordingServiceDeleteCleansObject(t *testing.T) {
 		}
 		if len(storage.removed) != 1 || storage.removed[0] != "recordings/7/5/a.webm" {
 			t.Fatalf("removed objects = %v", storage.removed)
+		}
+		if _, ok := storage.objects["recordings/7/5/a.webm"]; ok {
+			t.Fatalf("audio object should be removed from storage")
 		}
 	})
 
@@ -295,7 +307,7 @@ func TestRecordingServiceDeleteCleansObject(t *testing.T) {
 		storage := newFakeStorage()
 		svc := newTestRecordingService(repo, storage)
 
-		if err := svc.Delete(actor, 6); err != nil {
+		if err := svc.Delete(context.Background(), actor, 6); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		if len(storage.removed) != 0 {
@@ -308,7 +320,7 @@ func TestRecordingServiceDeleteCleansObject(t *testing.T) {
 		storage := newFakeStorage()
 		svc := newTestRecordingService(repo, storage)
 
-		err := svc.Delete(actor, 404)
+		err := svc.Delete(context.Background(), actor, 404)
 		var appErr *util.AppError
 		if !asAppError(err, &appErr) || appErr.Code != constants.CodeNotFound {
 			t.Fatalf("expected not found, got %v", err)
@@ -318,21 +330,69 @@ func TestRecordingServiceDeleteCleansObject(t *testing.T) {
 		}
 	})
 
-	t.Run("object cleanup failure surfaces internal error after db delete", func(t *testing.T) {
+	t.Run("cleanup failure keeps row so retry converges", func(t *testing.T) {
+		key := "recordings/7/5/a.webm"
 		repo := &fakeRecordingRepo{recordings: map[uint]*model.Recording{
-			5: {ID: 5, AudioKey: "k"},
+			5: {ID: 5, AudioKey: key},
 		}}
 		storage := newFakeStorage()
+		storage.objects[key] = []byte("x")
+		// 第一次删除对象失败，模拟存储抖动；之后恢复。
 		storage.removeErr = errors.New("minio down")
+		storage.removeFailN = 1
 		svc := newTestRecordingService(repo, storage)
 
-		err := svc.Delete(actor, 5)
+		// 第一次：返回失败，但记录必须保留、对象仍在。
+		err := svc.Delete(context.Background(), actor, 5)
 		var appErr *util.AppError
 		if !asAppError(err, &appErr) || appErr.Code != constants.CodeInternal {
-			t.Fatalf("expected internal error, got %v", err)
+			t.Fatalf("first delete: expected internal error, got %v", err)
 		}
-		if len(repo.deletedIDs) != 1 {
-			t.Fatalf("db row should already be deleted")
+		if len(repo.deletedIDs) != 0 {
+			t.Fatalf("db row must be kept on object removal failure, deletes=%v", repo.deletedIDs)
+		}
+		if _, ok := repo.recordings[5]; !ok {
+			t.Fatalf("recording row must remain for retry")
+		}
+		if _, ok := storage.objects[key]; !ok {
+			t.Fatalf("audio object must remain after failed removal")
+		}
+
+		// 第二次重试：存储已恢复，对象删除（幂等）后删除记录，最终一致。
+		if err := svc.Delete(context.Background(), actor, 5); err != nil {
+			t.Fatalf("retry delete: unexpected error: %v", err)
+		}
+		if len(repo.deletedIDs) != 1 || repo.deletedIDs[0] != 5 {
+			t.Fatalf("retry: deleted ids = %v, want [5]", repo.deletedIDs)
+		}
+		if _, ok := repo.recordings[5]; ok {
+			t.Fatalf("recording row should be gone after retry")
+		}
+		if _, ok := storage.objects[key]; ok {
+			t.Fatalf("audio object should be gone after retry")
+		}
+		if storage.removeCalls != 2 {
+			t.Fatalf("expected 2 remove calls (fail then success), got %d", storage.removeCalls)
+		}
+	})
+
+	t.Run("retry succeeds even when object already vanished", func(t *testing.T) {
+		// 上次可能已删掉对象、但删记录前崩溃；记录仍在。对象删除幂等，重试应能继续删掉记录。
+		key := "recordings/7/8/a.webm"
+		repo := &fakeRecordingRepo{recordings: map[uint]*model.Recording{
+			8: {ID: 8, AudioKey: key},
+		}}
+		storage := newFakeStorage() // 对象本就不存在
+		svc := newTestRecordingService(repo, storage)
+
+		if err := svc.Delete(context.Background(), actor, 8); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(repo.deletedIDs) != 1 || repo.deletedIDs[0] != 8 {
+			t.Fatalf("deleted ids = %v, want [8]", repo.deletedIDs)
+		}
+		if len(storage.removed) != 1 || storage.removed[0] != key {
+			t.Fatalf("removed = %v, want [%s]", storage.removed, key)
 		}
 	})
 }

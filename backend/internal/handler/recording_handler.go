@@ -195,7 +195,7 @@ func (h *RecordingHandler) Delete(c *gin.Context) {
 	if !ok {
 		return
 	}
-	if err := h.recordingSvc.Delete(actor, id); err != nil {
+	if err := h.recordingSvc.Delete(c.Request.Context(), actor, id); err != nil {
 		c.Error(err)
 		return
 	}

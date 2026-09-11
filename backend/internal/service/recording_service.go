@@ -27,8 +27,8 @@ type RecordingService interface {
 	UploadAudio(ctx context.Context, actor *model.User, id uint, filename string, file io.Reader, size int64, contentType string, duration int) (*model.Recording, error)
 	// OpenAudio 返回录音元数据与其音频内容流，调用方负责关闭流。
 	OpenAudio(ctx context.Context, id uint) (*model.Recording, io.ReadCloser, error)
-	// Delete 删除录音记录，并清理其在对象存储中的音频文件。
-	Delete(actor *model.User, id uint) error
+	// Delete 先清理对象存储中的音频文件，再删除录音记录；任一步失败后重试都能收敛到最终一致。
+	Delete(ctx context.Context, actor *model.User, id uint) error
 	CountByProject(projectID uint) (int64, error)
 }
 
@@ -216,7 +216,7 @@ func (s *recordingService) attachAudio(actor *model.User, id uint, audioKey stri
 	return recording, nil
 }
 
-func (s *recordingService) Delete(actor *model.User, id uint) error {
+func (s *recordingService) Delete(ctx context.Context, actor *model.User, id uint) error {
 	recording, err := s.recordingRepo.FindByID(id)
 	if err != nil {
 		if errors.Is(err, repository.ErrNotFound) {
@@ -224,16 +224,16 @@ func (s *recordingService) Delete(actor *model.User, id uint) error {
 		}
 		return util.NewAppError(constants.CodeInternal, fmt.Sprintf("查询录音 %d 失败", id), err)
 	}
-	audioKey := recording.AudioKey
-	if err := s.recordingRepo.Delete(id); err != nil {
-		return util.NewAppError(constants.CodeInternal, fmt.Sprintf("删除录音 %d 失败", id), err)
-	}
-	// 数据库记录删除成功后再清理对象存储；清理失败仅记录并返回错误，重试删除幂等收敛。
-	if audioKey != "" {
-		if err := s.storageSvc.Remove(context.Background(), audioKey); err != nil {
-			s.logger.Error("remove audio object failed", "recording_id", id, "object_key", audioKey, "error", err)
+	// 先清对象、后删记录。只要记录还在，audio_key 就在；即使上一次清理在删对象后、删记录前中断，
+	// 重试仍能凭记录中的 key 再清一次（对象存储删除幂等），最终删掉记录，保证两边一致且可重试。
+	if recording.AudioKey != "" {
+		if err := s.storageSvc.Remove(ctx, recording.AudioKey); err != nil {
+			s.logger.Error("remove audio object failed", "recording_id", id, "object_key", recording.AudioKey, "error", err)
 			return util.NewAppError(constants.CodeInternal, fmt.Sprintf("录音 %d 音频文件清理失败", id), err)
 		}
+	}
+	if err := s.recordingRepo.Delete(id); err != nil {
+		return util.NewAppError(constants.CodeInternal, fmt.Sprintf("删除录音 %d 失败", id), err)
 	}
 	s.logger.Info(fmt.Sprintf(constants.LogRecordingDelete, actor.Username, id))
 	return nil
