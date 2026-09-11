@@ -1,0 +1,116 @@
+openapi: 3.0.3
+info:
+  title: OralHistory 口述历史采集工具 API
+  description: 口述历史采集工具后端接口文档（Go 1.22 + Gin + GORM）
+  version: 1.0.0
+servers:
+  - url: http://localhost:9180/api/v1
+paths:
+  /auth/register:
+    post:
+      summary: 用户注册
+      tags: [auth]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                username: { type: string }
+                password: { type: string }
+                display_name: { type: string }
+                email: { type: string }
+                role: { type: string, enum: [admin, interviewer, archivist] }
+      responses:
+        '200': { description: 注册成功 }
+  /auth/login:
+    post:
+      summary: 用户登录
+      tags: [auth]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                username: { type: string }
+                password: { type: string }
+      responses:
+        '200':
+          description: 登录成功，返回 token
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string }
+  /auth/me:
+    get:
+      summary: 当前用户信息
+      tags: [auth]
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200': { description: 用户信息 }
+  /projects:
+    get:
+      summary: 项目列表（可按 status 筛选）
+      tags: [projects]
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - { name: page, in: query, schema: { type: integer } }
+        - { name: page_size, in: query, schema: { type: integer } }
+        - { name: status, in: query, schema: { type: string } }
+    post:
+      summary: 创建采访项目
+      tags: [projects]
+      security: [{ BearerAuth: [] }]
+  /projects/{id}:
+    get: { summary: 项目详情, tags: [projects], security: [{ BearerAuth: [] }] }
+    put: { summary: 更新项目, tags: [projects], security: [{ BearerAuth: [] }] }
+    delete: { summary: 删除项目, tags: [projects], security: [{ BearerAuth: [] }] }
+  /projects/{id}/status:
+    put:
+      summary: 项目状态流转
+      tags: [projects]
+      security: [{ BearerAuth: [] }]
+  /projects/{projectId}/questions:
+    get: { summary: 项目问题列表, tags: [questions], security: [{ BearerAuth: [] }] }
+    post: { summary: 添加问题, tags: [questions], security: [{ BearerAuth: [] }] }
+  /questions/{id}:
+    put: { summary: 更新问题, tags: [questions], security: [{ BearerAuth: [] }] }
+    delete: { summary: 删除问题, tags: [questions], security: [{ BearerAuth: [] }] }
+  /recordings:
+    get:
+      summary: 录音列表（project_id 或 question_id）
+      tags: [recordings]
+      security: [{ BearerAuth: [] }]
+    post: { summary: 创建录音记录, tags: [recordings], security: [{ BearerAuth: [] }] }
+  /recordings/{id}:
+    get: { summary: 录音详情, tags: [recordings], security: [{ BearerAuth: [] }] }
+    put: { summary: 更新录音, tags: [recordings], security: [{ BearerAuth: [] }] }
+    delete: { summary: 删除录音, tags: [recordings], security: [{ BearerAuth: [] }] }
+  /recordings/{id}/audio:
+    post: { summary: 上传录音文件(multipart), tags: [recordings], security: [{ BearerAuth: [] }] }
+    get: { summary: 播放录音音频流, tags: [recordings], security: [{ BearerAuth: [] }] }
+  /timeline-markers:
+    get:
+      summary: 时间轴节点列表（project_id 或 recording_id）
+      tags: [timeline]
+      security: [{ BearerAuth: [] }]
+    post: { summary: 标注时间轴节点, tags: [timeline], security: [{ BearerAuth: [] }] }
+  /timeline-markers/{id}:
+    put: { summary: 更新时间轴节点, tags: [timeline], security: [{ BearerAuth: [] }] }
+    delete: { summary: 删除时间轴节点, tags: [timeline], security: [{ BearerAuth: [] }] }
+  /audit-logs:
+    get:
+      summary: 审计日志列表（仅管理员）
+      tags: [audit]
+      security: [{ BearerAuth: [] }]
+  /users:
+    get: { summary: 用户列表（仅管理员）, tags: [users], security: [{ BearerAuth: [] }] }
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT

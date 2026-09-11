@@ -1,0 +1,85 @@
+-- 口述历史采集工具初始化脚本（MySQL 8.0）
+-- 注意：应用启动时会通过 GORM AutoMigrate 自动建表，本脚本作为数据库初始化基线。
+
+CREATE DATABASE IF NOT EXISTS oralhistory_db DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+USE oralhistory_db;
+
+CREATE TABLE IF NOT EXISTS users (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  username VARCHAR(64) NOT NULL UNIQUE,
+  password_hash VARCHAR(255) NOT NULL,
+  display_name VARCHAR(64) NOT NULL,
+  email VARCHAR(128) DEFAULT '',
+  role VARCHAR(32) NOT NULL DEFAULT 'interviewer',
+  created_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS projects (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  title VARCHAR(128) NOT NULL,
+  interviewee_name VARCHAR(64) NOT NULL,
+  birth_year INT NOT NULL,
+  background TEXT,
+  status VARCHAR(32) NOT NULL DEFAULT 'draft',
+  created_by BIGINT UNSIGNED NOT NULL,
+  created_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  INDEX idx_projects_status (status),
+  INDEX idx_projects_created_by (created_by)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS questions (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  project_id BIGINT UNSIGNED NOT NULL,
+  content VARCHAR(512) NOT NULL,
+  sort_order INT NOT NULL DEFAULT 0,
+  created_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  INDEX idx_questions_project (project_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS recordings (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  project_id BIGINT UNSIGNED NOT NULL,
+  question_id BIGINT UNSIGNED NOT NULL,
+  audio_key VARCHAR(255) DEFAULT '',
+  duration_seconds INT NOT NULL DEFAULT 0,
+  summary VARCHAR(512) DEFAULT '',
+  status VARCHAR(32) NOT NULL DEFAULT 'recording',
+  created_by BIGINT UNSIGNED NOT NULL,
+  created_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  INDEX idx_recordings_project (project_id),
+  INDEX idx_recordings_question (question_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS timeline_markers (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  project_id BIGINT UNSIGNED NOT NULL,
+  recording_id BIGINT UNSIGNED NOT NULL,
+  timestamp_second INT NOT NULL,
+  label VARCHAR(128) NOT NULL,
+  note VARCHAR(512) DEFAULT '',
+  created_by BIGINT UNSIGNED NOT NULL,
+  created_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  INDEX idx_markers_project (project_id),
+  INDEX idx_markers_recording (recording_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS audit_logs (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  user_id BIGINT UNSIGNED NOT NULL,
+  username VARCHAR(64) NOT NULL,
+  role VARCHAR(32) DEFAULT '',
+  action VARCHAR(64) NOT NULL,
+  entity_type VARCHAR(32) NOT NULL,
+  entity_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  detail VARCHAR(512) DEFAULT '',
+  ip VARCHAR(64) DEFAULT '',
+  request_id VARCHAR(64) DEFAULT '',
+  created_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3),
+  INDEX idx_audit_user (user_id),
+  INDEX idx_audit_created (created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
